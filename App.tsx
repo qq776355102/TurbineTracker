@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Settings, Play, Pause, AlertCircle, Database, Download, RefreshCw, Activity, Users, Wallet, Layers, Calendar, Clock } from 'lucide-react';
+import { Settings, Play, Pause, AlertCircle, Database, Download, RefreshCw, Activity, Users, Wallet, Layers, Calendar, Clock, RotateCcw } from 'lucide-react';
 import { LogEvent, SyncStatus, AggregatedData, DailyData, DEFAULT_RPC, LGNS_DECIMALS } from './types';
 import { db, saveEvents, getAllEvents, clearDatabase, getLatestStoredBlock } from './services/db';
 import { RPCService } from './services/rpc';
@@ -12,10 +12,8 @@ const BLOCK_TIME_SEC = 2;
 // Helper to get the Local ISO string for Today's UTC 00:00
 const getDefaultStartDate = () => {
   const now = new Date();
-  // Create a date object representing UTC Midnight of the current day
   const utcMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   
-  // Format to local ISO string (YYYY-MM-DDThh:mm) to populate the input
   const year = utcMidnight.getFullYear();
   const month = String(utcMidnight.getMonth() + 1).padStart(2, '0');
   const day = String(utcMidnight.getDate()).padStart(2, '0');
@@ -34,7 +32,7 @@ export default function App() {
   
   // Chain State
   const [currentBlock, setCurrentBlock] = useState<number>(0); 
-  const [chainTimestamp, setChainTimestamp] = useState<number>(0); // Timestamp of the current head block (ms)
+  const [chainTimestamp, setChainTimestamp] = useState<number>(0); 
   const [scannedBlock, setScannedBlock] = useState<number>(0); 
   
   // App State
@@ -43,9 +41,11 @@ export default function App() {
   const [logs, setLogs] = useState<LogEvent[]>([]);
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [viewMode, setViewMode] = useState<'ALL' | 'TODAY'>('ALL');
+  const [retryCount, setRetryCount] = useState<number>(0);
   
   // Logic Refs
   const isSyncingRef = useRef(false);
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const rpcRef = useRef<RPCService>(new RPCService(DEFAULT_RPC));
   
   // Derived Data
@@ -57,6 +57,13 @@ export default function App() {
   useEffect(() => {
     loadDataFromDB();
     fetchChainInfo();
+    
+    // Auto-refresh stats every 4 hours as requested (visual only, sync is manual/continuous)
+    const interval = setInterval(() => {
+      fetchChainInfo();
+    }, 4 * 60 * 60 * 1000);
+
+    return () => clearInterval(interval);
   }, []);
 
   // Re-calculate start block when date or chain info changes
@@ -71,30 +78,23 @@ export default function App() {
       const blockNum = await rpcRef.current.getBlockNumber();
       const blockTs = await rpcRef.current.getBlockTimestamp(blockNum);
       
-      // Update anchor for better estimation of event timestamps
       rpcRef.current.updateAnchor(blockNum, blockTs);
       
       setCurrentBlock(blockNum);
       setChainTimestamp(blockTs);
     } catch (e: any) {
       console.warn("Could not fetch chain info", e);
-      setErrorMsg(`Failed to fetch chain info: ${e.message}`);
+      setErrorMsg(`Chain Info Error: ${e.message}`);
     }
   };
 
   const calculateStartBlock = () => {
     if (!startDateInput || currentBlock === 0 || chainTimestamp === 0) return;
 
-    // targetTime is the timestamp of the User's Input (Local Time)
     const targetTime = new Date(startDateInput).getTime();
-    
-    // Logic: 
-    // Diff = ChainHeadTime - TargetTime
-    // BlocksAgo = Diff / 2s
     const diffMs = chainTimestamp - targetTime;
     const diffSeconds = diffMs / 1000;
     
-    // If target is in the future relative to chain, start at head
     if (diffSeconds < 0) {
       setCalculatedStartBlock(currentBlock);
       return;
@@ -106,7 +106,6 @@ export default function App() {
     setCalculatedStartBlock(start);
   };
 
-  // Helper for UI to show the estimated time of the calculated block
   const getCalculatedBlockTime = () => {
     if (calculatedStartBlock === 0 || currentBlock === 0 || chainTimestamp === 0) return null;
     const blocksAgo = currentBlock - calculatedStartBlock;
@@ -126,33 +125,28 @@ export default function App() {
     }
   };
 
-  // --- Processing Logic ---
   const processData = (events: LogEvent[]) => {
     const aggMap = new Map<string, { total: bigint, count: number }>();
     const todayAggMap = new Map<string, { total: bigint, count: number }>();
     const dayMap = new Map<string, bigint>();
 
     const now = new Date();
-    // Use Local Midnight for "Today" view to match user's local context
     const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
 
     events.forEach(ev => {
       const amount = BigInt(ev.silenceAmount);
 
-      // 1. All Time
       const current = aggMap.get(ev.recipient) || { total: 0n, count: 0 };
       aggMap.set(ev.recipient, {
         total: current.total + amount,
         count: current.count + 1
       });
 
-      // 2. Daily
       const dateObj = new Date(ev.timestamp);
       const dateKey = dateObj.toISOString().split('T')[0];
       const dayTotal = dayMap.get(dateKey) || 0n;
       dayMap.set(dateKey, dayTotal + amount);
 
-      // 3. Today (Local)
       if (ev.timestamp >= localMidnight) {
          const tCurrent = todayAggMap.get(ev.recipient) || { total: 0n, count: 0 };
          todayAggMap.set(ev.recipient, {
@@ -186,48 +180,50 @@ export default function App() {
   };
 
   // --- Indexing Loop ---
-  const startSync = useCallback(async () => {
-    if (status === SyncStatus.SYNCING) return;
+  const startSync = useCallback(async (isRetry = false) => {
+    // If we are already syncing and this isn't a retry call, ignore.
+    if (status === SyncStatus.SYNCING && !isRetry) return;
     
-    // Validate RPC & Init
+    // Clear previous retry timeouts
+    if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+    }
+
     try {
       setStatus(SyncStatus.SYNCING);
-      setErrorMsg(null);
+      if (!isRetry) setErrorMsg(null); // Keep error msg visible during retry wait, clear on actual start
       
-      // Refresh chain head first to be sure
       const head = await rpcRef.current.getBlockNumber();
       const headTs = await rpcRef.current.getBlockTimestamp(head);
       
-      // CRITICAL: Update anchor so estimations are accurate relative to NOW
       rpcRef.current.updateAnchor(head, headTs);
-      
       setCurrentBlock(head);
       setChainTimestamp(headTs);
       
-      // Determine start pointer
       let currentPointer: number;
       if (scannedBlock > 0) {
         currentPointer = scannedBlock;
       } else {
-        // Calculate based on fresh chain info to ensure accuracy
-        // Re-use logic: HeadTime - TargetTime
         const targetTime = new Date(startDateInput).getTime();
         const diffMs = headTs - targetTime;
         const diffSeconds = diffMs / 1000;
-        // Check for future date or negative diff
         const blocksAgo = Math.max(0, Math.floor(diffSeconds / BLOCK_TIME_SEC));
         currentPointer = Math.max(0, head - blocksAgo);
         setCalculatedStartBlock(currentPointer);
       }
       
+      // If caught up, stay in COMPLETED state but don't error
       if (currentPointer >= head) {
         setStatus(SyncStatus.COMPLETED);
+        // Reset retry count on success
+        setRetryCount(0); 
         return;
       }
 
       isSyncingRef.current = true;
+      setRetryCount(0); // Reset retry count once we successfully start the loop
       
-      // Sync Loop
       while (isSyncingRef.current && currentPointer < head) {
         const safeBatch = Math.max(1, batchSize);
         const toBlock = Math.min(currentPointer + safeBatch, head);
@@ -250,14 +246,12 @@ export default function App() {
           setScannedBlock(toBlock);
           setLastUpdated(new Date());
 
+          // Small delay to be nice to RPC
           await new Promise(r => setTimeout(r, 200));
 
         } catch (err: any) {
           console.error("Sync error:", err);
-          setErrorMsg(`RPC Error: ${err.message || "Unknown"}. Pausing. Change RPC or Batch Size.`);
-          setStatus(SyncStatus.ERROR);
-          isSyncingRef.current = false;
-          break;
+          throw err; // Re-throw to be caught by outer handler
         }
       }
 
@@ -266,13 +260,27 @@ export default function App() {
       }
 
     } catch (err: any) {
-      setErrorMsg(`Failed to connect/sync: ${err.message}`);
+      // Error Recovery Mechanism
+      const msg = err.message || "Unknown Error";
+      setErrorMsg(`RPC Error: ${msg}. Retrying in 5s...`);
       setStatus(SyncStatus.ERROR);
+      
+      // Auto-Retry Logic
+      if (isSyncingRef.current) {
+          const timeout = setTimeout(() => {
+             setRetryCount(prev => prev + 1);
+             startSync(true);
+          }, 5000);
+          retryTimeoutRef.current = timeout;
+      } else {
+          isSyncingRef.current = false;
+      }
     }
   }, [scannedBlock, startDateInput, status, batchSize]);
 
   const stopSync = () => {
     isSyncingRef.current = false;
+    if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
     setStatus(SyncStatus.PAUSED);
   };
 
@@ -282,12 +290,26 @@ export default function App() {
   };
 
   const applyRpc = () => {
+    // 1. Update Service
     rpcRef.current = new RPCService(rpcUrl);
-    if (status === SyncStatus.ERROR) {
-      setErrorMsg(null);
-      setStatus(SyncStatus.IDLE);
-    }
+    
+    // 2. Clear Errors
+    setErrorMsg(null);
+    setRetryCount(0);
+    
+    // 3. Refresh Chain Info
     fetchChainInfo();
+
+    // 4. Auto-Resume if we were stuck or syncing
+    if (status === SyncStatus.ERROR || status === SyncStatus.SYNCING || status === SyncStatus.COMPLETED) {
+       // Ensure we stop any pending retries
+       if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+       // Force restart
+       isSyncingRef.current = false; 
+       setTimeout(() => {
+         startSync();
+       }, 500);
+    }
   };
 
   const handleExport = () => {
@@ -314,7 +336,7 @@ export default function App() {
       setScannedBlock(0);
       setCalculatedStartBlock(0);
       setStatus(SyncStatus.IDLE);
-      fetchChainInfo(); // Refresh info
+      fetchChainInfo(); 
     }
   };
 
@@ -348,7 +370,7 @@ export default function App() {
                 status === SyncStatus.COMPLETED ? 'bg-emerald-400' :
                 'bg-slate-400'
               }`}></span>
-              {status}
+              {status === SyncStatus.ERROR && retryTimeoutRef.current ? 'RETRYING...' : status}
             </div>
             <button onClick={handleExport} className="flex items-center gap-2 text-sm text-slate-400 hover:text-white transition-colors">
               <Download size={16} /> Export {viewMode === 'TODAY' ? 'Today' : 'All'}
@@ -361,17 +383,20 @@ export default function App() {
         
         {/* Error Banner */}
         {errorMsg && (
-          <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 flex items-start gap-3">
+          <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 flex items-start gap-3 animate-fade-in">
             <AlertCircle className="text-red-400 shrink-0 mt-0.5" size={20} />
             <div className="flex-1">
               <h3 className="text-red-400 font-semibold text-sm">Synchronization Error</h3>
               <p className="text-red-300/80 text-sm mt-1">{errorMsg}</p>
               <div className="flex gap-3 mt-3">
                  <button 
-                  onClick={startSync}
-                  className="text-xs bg-red-500 hover:bg-red-600 text-white px-3 py-1.5 rounded transition-colors"
+                  onClick={() => {
+                      if(retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
+                      startSync();
+                  }}
+                  className="flex items-center gap-1 text-xs bg-red-500 hover:bg-red-600 text-white px-3 py-1.5 rounded transition-colors"
                 >
-                  Retry Connection
+                  <RotateCcw size={12} /> Retry Now
                 </button>
               </div>
             </div>
@@ -391,13 +416,13 @@ export default function App() {
                   value={rpcUrl} 
                   onChange={handleRpcChange}
                   className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="https://polygon-bor-rpc.publicnode.com"
+                  placeholder="https://polygon-rpc.com"
                 />
                 <button 
                   onClick={applyRpc}
                   className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-sm font-medium transition-colors"
                 >
-                  Set
+                  Set & Resume
                 </button>
               </div>
             </div>
@@ -439,7 +464,7 @@ export default function App() {
                 </button>
               ) : (
                 <button 
-                  onClick={startSync}
+                  onClick={() => startSync()}
                   className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-semibold shadow-lg shadow-blue-500/20 transition-all"
                 >
                   <Play size={16} fill="currentColor" /> {status === SyncStatus.PAUSED || status === SyncStatus.ERROR ? 'Resume' : 'Start Sync'}
