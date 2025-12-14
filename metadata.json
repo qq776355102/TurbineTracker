@@ -1,0 +1,5 @@
+{
+  "name": "Polygon TurbineSilenced Tracker",
+  "description": "A specialized dashboard to track, aggregate, and visualize TurbineSilenced events on the Polygon network. Features robust error handling, RPC switching, local persistence, and data export.",
+  "requestFramePermissions": []
+}
