@@ -441,7 +441,7 @@ export default function App() {
         <div className="bg-slate-800 border border-slate-700 rounded-xl shadow-lg overflow-hidden">
           <div className="p-6 border-b border-slate-700 flex flex-col sm:flex-row justify-between items-center gap-4">
             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-              Top Recipients (>{displayThreshold} LGNS)
+              Top Recipients (&gt;{displayThreshold} LGNS)
             </h3>
             
             <div className="flex items-center bg-slate-900 rounded-lg p-1 border border-slate-700">
